@@ -23,17 +23,17 @@
 
   tasks:
   - name: Enroll certificate
-      venafi.machine_identity.venafi_certificate:
-        token: "{{ venafi_api_key }}"
-        zone: "AAP25DemoCrt\AAP25DemoCert"
-        common_name: "webserver.mbredeme.com"
-        # dns_names:
-          # - "webserver.mbredeme.com"
-        # csr_origin: service
-        # key_format: pem
-        # key_path: "/etc/pki/tls/private/webserver.key"
-        # cert_path: "/etc/pki/tls/certs/webserver.crt"
-        # chain_path: "/etc/pki/tls/certs/webserver-chain.crt"
+    venafi.machine_identity.venafi_certificate:
+      token: "{{ venafi_api_key }}"
+      zone: "AAP25DemoCrt\\AAP25DemoCert"
+      common_name: "webserver.mbredeme.com"
+      # dns_names:
+        # - "webserver.mbredeme.com"
+      # csr_origin: service
+      # key_format: pem
+      # key_path: "/etc/pki/tls/private/webserver.key"
+      # cert_path: "/etc/pki/tls/certs/webserver.crt"
+      # chain_path: "/etc/pki/tls/certs/webserver-chain.crt"
 
 
 
