@@ -33,7 +33,8 @@
       # key_format: pem
       # key_path: "/etc/pki/tls/private/webserver.key"
       # cert_path: "/etc/pki/tls/certs/webserver.crt"
-      cert_path: "/tmp"
+      key_path:  "/tmp/webserver.key"         # <-- provide a real path
+      cert_path: "/tmp/webserver.crt" 
       # chain_path: "/etc/pki/tls/certs/webserver-chain.crt"
 
 
