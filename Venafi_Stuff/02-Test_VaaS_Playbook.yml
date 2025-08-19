@@ -8,6 +8,10 @@
   gather_facts: false
   become: true
 
+  collections:
+    - community.crypto
+    - venafi.machine_identity
+
   vars:
     # Provide via Credential or Extra Vars (ENV fallback for quick tests)
     venafi_api_key: "{{ venafi_api_key | default(lookup('env','VENAFI_APIKEY'), true) }}"
