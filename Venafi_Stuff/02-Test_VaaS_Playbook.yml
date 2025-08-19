@@ -1,28 +1,32 @@
 ---
-- name: venafi_certificate_cloud (local CSR)
+---
+# venafi_certificate_cloud.yml
+# AAP 2.5-friendly: no external openssl binary required
+
+- name: venafi_certificate_cloud (local CSR, crypto modules)
   hosts: localhost
   connection: local
   gather_facts: false
   become: true
 
   vars:
-    # Inject via Controller credential or env var VENAFI_APIKEY
+    # Provide via Credential or Extra Vars (ENV fallback for quick tests)
     venafi_api_key: "{{ venafi_api_key | default(lookup('env','VENAFI_APIKEY'), true) }}"
     venafi_zone:    "{{ venafi_zone    | default('MyApp\\Default') }}"
 
-    # Certificate request parameters
+    # Cert request parameters (override via Survey/Extra Vars)
     common_name: "www.example.com"
     dns_sans:
       - "www.example.com"
       - "example.com"
 
-    # Key/CSR/Cert destinations (RHEL-style)
+    # RHEL-style paths
     key_dest_path:   "/etc/pki/tls/private/{{ common_name }}.key"
-    csr_dest_path:   "/etc/pki/tls/csr/{{ common_name }}.csr"      # <-- REQUIRED
+    csr_dest_path:   "/etc/pki/tls/csr/{{ common_name }}.csr"
     cert_dest_path:  "/etc/pki/tls/certs/{{ common_name }}.crt"
     chain_dest_path: "/etc/pki/tls/certs/{{ common_name }}-chain.crt"
 
-    # Optional service to restart post-issuance
+    # Optional: restart a service after issuance/renewal
     restart_handler: "restart nginx"
 
   pre_tasks:
@@ -36,36 +40,24 @@
         - "/etc/pki/tls/csr"
         - "/etc/pki/tls/certs"
 
-    - name: Generate private key if missing (2048-bit RSA)
-      ansible.builtin.command:
-        argv: ["openssl", "genrsa", "-out", "{{ key_dest_path }}", "2048"]
-      args:
-        creates: "{{ key_dest_path }}"
-
-    - name: Generate CSR if missing (with SANs)
-      ansible.builtin.shell: |
-        cat > /tmp/req_{{ common_name }}.cnf <<'EOF'
-        [ req ]
-        prompt = no
-        default_md = sha256
-        distinguished_name = dn
-        req_extensions = v3_req
-
-        [ dn ]
-        CN = {{ common_name }}
-
-        [ v3_req ]
-        subjectAltName = {{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | join(',') }}
-        EOF
-
-        openssl req -new -key "{{ key_dest_path }}" \
-          -out "{{ csr_dest_path }}" \
-          -config /tmp/req_{{ common_name }}.cnf
-      args:
-        creates: "{{ csr_dest_path }}"
-
   tasks:
-    - name: Enroll/renew certificate via Venafi (local CSR; explicit csr_path)
+    - name: Generate private key (RSA 2048) – no external openssl
+      community.crypto.openssl_privatekey:
+        path: "{{ key_dest_path }}"
+        type: rsa
+        size: 2048
+        mode: "0600"
+
+    - name: Generate CSR with SANs – no external openssl
+      community.crypto.openssl_csr:
+        path: "{{ csr_dest_path }}"
+        privatekey_path: "{{ key_dest_path }}"
+        common_name: "{{ common_name }}"
+        # List of SANs like ["DNS:foo","DNS:bar"]
+        subject_alt_name: "{{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | list }}"
+        mode: "0644"
+
+    - name: Request/Renew certificate from Venafi (local CSR; explicit paths)
       venafi.machine_identity.venafi_certificate:
         token: "{{ venafi_api_key }}"
         zone:  "{{ venafi_zone }}"
@@ -73,16 +65,16 @@
 
         csr_origin: local
         privatekey_path: "{{ key_dest_path }}"
-        csr_path:       "{{ csr_dest_path }}"      # <-- EXACT PATH PROVIDED
+        csr_path:       "{{ csr_dest_path }}"
 
-        # Some collection versions expect 'path', others 'cert_path' → set both
+        # Work around collection alias quirks by setting both
         path:      "{{ cert_dest_path }}"
         cert_path: "{{ cert_dest_path }}"
 
         chain_option: last
         chain_path: "{{ chain_dest_path }}"
 
-        # Some versions still read alt_name even with CSR — safe to include
+        # Safe to include even with CSR; ignored by some versions, used by others
         alt_name: "{{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | join(',') }}"
 
         unsafe_writes: true
