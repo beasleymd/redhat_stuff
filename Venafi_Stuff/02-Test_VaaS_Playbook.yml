@@ -1,5 +1,4 @@
 ---
----
 # venafi_certificate_cloud.yml
 # AAP 2.5-friendly: no external openssl binary required
 
