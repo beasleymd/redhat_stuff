@@ -36,21 +36,7 @@
       # key_path:  "/tmp/webserver.key"         # <-- provide a real path
       cert_path: "/tmp/webserver.crt" 
       # chain_path: "/etc/pki/tls/certs/webserver-chain.crt"
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  - name: dump test output
-    debug:
+   
+   - name: dump test output
+      debug:
       msg: '{{ certout }}'

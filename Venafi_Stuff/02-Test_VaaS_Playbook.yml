@@ -1,0 +1,60 @@
+- name: venafi_certificate_cloud
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: true
+
+  vars:
+    # Inject via Controller credential or env var VENAFI_APIKEY
+    venafi_api_key: "{{ venafi_api_key | default(lookup('env','VENAFI_APIKEY'), true) }}"
+    venafi_zone: "{{ venafi_zone | default('MyApp\\Default') }}"
+
+    # Certificate request parameters
+    common_name: "www.example.com"
+    dns_sans:
+      - "www.example.com"
+      - "example.com"
+
+    # Output destinations
+    cert_dest_path:  "/etc/pki/tls/certs/www.example.com.crt"
+    chain_dest_path: "/etc/pki/tls/certs/www.example.com.chain.crt"
+
+    # Optional: service to restart after issuance/renewal
+    restart_handler: "restart nginx"
+
+  tags:
+    - cloud
+
+  pre_tasks:
+    - name: Ensure certificate directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "/etc/pki/tls/certs"
+
+  tasks:
+    - name: Enroll/renew certificate via Venafi as a Service (service-side CSR)
+      venafi.machine_identity.venafi_certificate:
+        token: "{{ venafi_api_key }}"
+        zone: "{{ venafi_zone }}"
+        common_name: "{{ common_name }}"
+        csr_origin: service                       # VaaS generates CSR/key; no local paths
+        path: "{{ cert_dest_path }}"              # use ONE of path or cert_path (alias)
+        chain_option: last
+        chain_path: "{{ chain_dest_path }}"       # required when requesting chain
+        alt_name: "{{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | join(',') }}"
+        unsafe_writes: true
+      register: certout
+      notify: "{{ restart_handler }}"
+
+    - name: dump test output
+      ansible.builtin.debug:
+        var: certout
+
+  handlers:
+    - name: restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
