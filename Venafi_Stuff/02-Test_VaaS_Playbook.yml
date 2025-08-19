@@ -1,3 +1,4 @@
+---
 - name: venafi_certificate_cloud
   hosts: localhost
   connection: local
@@ -15,15 +16,15 @@
       - "www.example.com"
       - "example.com"
 
-    # Output destinations
-    cert_dest_path:  "/etc/pki/tls/certs/www.example.com.crt"
-    chain_dest_path: "/etc/pki/tls/certs/www.example.com.chain.crt"
+    # Output destinations (RHEL-style paths)
+    cert_dest_path:  "/etc/pki/tls/certs/{{ common_name }}.crt"
+    chain_dest_path: "/etc/pki/tls/certs/{{ common_name }}-chain.crt"
 
-    # Optional: service to restart after issuance/renewal
+    # Optional service restart
     restart_handler: "restart nginx"
 
   pre_tasks:
-    - name: Ensure certificate directories exist
+    - name: Ensure cert directories exist
       ansible.builtin.file:
         path: "/etc/pki/tls/certs"
         state: directory
@@ -35,11 +36,12 @@
         token: "{{ venafi_api_key }}"
         zone: "{{ venafi_zone }}"
         common_name: "{{ common_name }}"
-        csr_origin: service                 # VaaS generates CSR/key
+        csr_origin: service                 # VaaS generates CSR/key (no local key/csr paths)
 
-        # IMPORTANT: This collection version expects 'cert_path'
+        # Your collection version expects 'cert_path' (not 'path')
         cert_path: "{{ cert_dest_path }}"
 
+        # Chain handling: since we want a chain, we must provide chain_path
         chain_option: last
         chain_path: "{{ chain_dest_path }}"
 
