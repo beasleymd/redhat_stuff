@@ -22,17 +22,12 @@
     # Optional: service to restart after issuance/renewal
     restart_handler: "restart nginx"
 
-  tags:
-    - cloud
-
   pre_tasks:
     - name: Ensure certificate directories exist
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "/etc/pki/tls/certs"
         state: directory
         mode: "0755"
-      loop:
-        - "/etc/pki/tls/certs"
 
   tasks:
     - name: Enroll/renew certificate via Venafi as a Service (service-side CSR)
@@ -40,16 +35,22 @@
         token: "{{ venafi_api_key }}"
         zone: "{{ venafi_zone }}"
         common_name: "{{ common_name }}"
-        csr_origin: service                       # VaaS generates CSR/key; no local paths
-        path: "{{ cert_dest_path }}"              # use ONE of path or cert_path (alias)
+        csr_origin: service                 # VaaS generates CSR/key
+
+        # IMPORTANT: This collection version expects 'cert_path'
+        cert_path: "{{ cert_dest_path }}"
+
         chain_option: last
-        chain_path: "{{ chain_dest_path }}"       # required when requesting chain
+        chain_path: "{{ chain_dest_path }}"
+
+        # SANs: comma-separated DNS entries
         alt_name: "{{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | join(',') }}"
+
         unsafe_writes: true
       register: certout
       notify: "{{ restart_handler }}"
 
-    - name: dump test output
+    - name: Show module result
       ansible.builtin.debug:
         var: certout
 
