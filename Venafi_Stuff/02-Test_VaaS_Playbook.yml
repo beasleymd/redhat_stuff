@@ -6,25 +6,19 @@
   become: true
 
   vars:
-    # Inject via Controller credential or env var VENAFI_APIKEY
     venafi_api_key: "{{ venafi_api_key | default(lookup('env','VENAFI_APIKEY'), true) }}"
     venafi_zone: "{{ venafi_zone | default('MyApp\\Default') }}"
-
-    # Certificate request parameters
     common_name: "www.example.com"
     dns_sans:
       - "www.example.com"
       - "example.com"
 
-    # Output destinations (RHEL-style paths)
     cert_dest_path:  "/etc/pki/tls/certs/{{ common_name }}.crt"
     chain_dest_path: "/etc/pki/tls/certs/{{ common_name }}-chain.crt"
-
-    # Optional service restart
     restart_handler: "restart nginx"
 
   pre_tasks:
-    - name: Ensure cert directories exist
+    - name: Ensure cert directory exists
       ansible.builtin.file:
         path: "/etc/pki/tls/certs"
         state: directory
@@ -36,16 +30,16 @@
         token: "{{ venafi_api_key }}"
         zone: "{{ venafi_zone }}"
         common_name: "{{ common_name }}"
-        csr_origin: service                 # VaaS generates CSR/key (no local key/csr paths)
+        csr_origin: service                   # VaaS generates CSR/key
 
-        # Your collection version expects 'cert_path' (not 'path')
+        # Set BOTH to dodge module-version alias quirks
+        path: "{{ cert_dest_path }}"
         cert_path: "{{ cert_dest_path }}"
 
-        # Chain handling: since we want a chain, we must provide chain_path
         chain_option: last
         chain_path: "{{ chain_dest_path }}"
 
-        # SANs: comma-separated DNS entries
+        # SANs as comma-separated DNS entries
         alt_name: "{{ dns_sans | map('regex_replace','^(.*)$','DNS:\\1') | join(',') }}"
 
         unsafe_writes: true
