@@ -40,14 +40,14 @@
         - "/etc/pki/tls/certs"
 
   tasks:
-    - name: Generate private key (RSA 2048) – no external openssl
+    - name: Generate private key (RSA 2048) - no external openssl
       community.crypto.openssl_privatekey:
         path: "{{ key_dest_path }}"
         type: rsa
         size: 2048
         mode: "0600"
 
-    - name: Generate CSR with SANs – no external openssl
+    - name: Generate CSR with SANs - no external openssl
       community.crypto.openssl_csr:
         path: "{{ csr_dest_path }}"
         privatekey_path: "{{ key_dest_path }}"
