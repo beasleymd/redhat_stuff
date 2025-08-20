@@ -62,18 +62,21 @@
       ansible.builtin.set_fact:
         now_iso: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
 
-    - name: Build candidates with days_left
+    - name: Init candidates list
       ansible.builtin.set_fact:
-        candidates: >-
+        candidates: []
+
+    - name: Append each cert with days_left
+      ansible.builtin.set_fact:
+        candidates: "{{ candidates + [ item | combine({'days_left': days_left}) ] }}"
+      vars:
+        days_left: >-
           {{
-            all_certs
-            | selectattr('validTo','defined')
-            | map('combine',
-                  [{'days_left':
-                      (((item.validTo | to_datetime) - (now_iso | to_datetime)).days)
-                   } for item in all_certs if item.validTo is defined]
-                 )
+            ((item.validTo | to_datetime) - (now_iso | to_datetime)).days
           }}
+      loop: "{{ all_certs }}"
+      when: item.validTo is defined
+
 
     - name: Filter to exactly day 7
       ansible.builtin.set_fact:
