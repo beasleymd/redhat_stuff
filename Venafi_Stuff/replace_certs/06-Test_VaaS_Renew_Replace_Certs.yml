@@ -104,10 +104,12 @@
 
     # 4) Renew each expiring cert (loop include)
     - name: Renew each expiring cert (≤ 7 days)
-      ansible.builtin.include_tasks: renew_one.yml
-      loop: "{{ expiring_soon }}"
-      loop_control:
-        loop_var: cert_item
+      block:
+        - name: run renew_one for each item
+          ansible.builtin.include_tasks: renew_one.yml
+          loop: "{{ expiring_soon }}"
+          loop_control:
+            loop_var: cert_item
       rescue:
         - ansible.builtin.debug:
             msg: "At least one renewal failed; see prior errors."
