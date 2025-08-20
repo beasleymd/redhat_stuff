@@ -20,6 +20,8 @@
     apps_json: "{{ out_dir }}/applications.json"
     certs_json: "{{ out_dir }}/certificates.json"
 
+
+
   pre_tasks:
     - name: Ensure output directory exists
       ansible.builtin.file:
@@ -94,11 +96,47 @@
         msg: "{{ vaas_parsed_certs.certificates | map(attribute='certificateName') | list }}"
 
     # Optional: show expiring soon (example: <= 7 days). Adjust as you like.
-#    - name: Compute 'expiring within 7 days' subset (best-effort)
-#      ansible.builtin.set_fact:
+    - name: Check cert 'expiring within 7 days' subset (best-effort)
+      ansible.builtin.set_fact:
 #        expiring_soon: >-
 #          {{vaas_parsed_certs.certificates | default([]))
 #           | selectattr('validTo', 'defined')
 #           | selectattr('validTo', 'search', '.*')    # keep those with a value
 #           | list
 #          }}
+
+
+    - name: Compute current time (UTC) as ISO8601 (no facts required)
+      ansible.builtin.set_fact:
+        now_iso: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Init expiring_soon list
+      ansible.builtin.set_fact:
+        expiring_soon: []
+
+    - name: Build 'expiring_soon' (validTo within 7 days from now)
+      ansible.builtin.set_fact:
+        expiring_soon: "{{ expiring_soon + [ item | combine({'days_left': days_left}) ] }}"
+      vars:
+        days_left: >-
+          {{
+            (
+              (item.validTo | to_datetime) - (now_iso | to_datetime)
+            ).days
+          }}
+      loop: "{{ vaas_parsed_certs.certificates | default([]) }}"
+      when:
+        - item.validTo is defined
+        - item.validTo | string | length > 0
+        - ((item.validTo | to_datetime) - (now_iso | to_datetime)).days <= 7
+        - ((item.validTo | to_datetime) - (now_iso | to_datetime)).days >= 0
+
+    - name: Preview expiring soon (sorted by days_left)
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            (expiring_soon | sort(attribute='days_left'))
+            | to_nice_json
+          }}
+
+    # ========= /NEW =========
