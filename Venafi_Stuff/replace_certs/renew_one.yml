@@ -1,0 +1,154 @@
+# Per-certificate renewal workflow (used by include_tasks)
+
+- name: Extract fields
+  ansible.builtin.set_fact:
+    cert_id: "{{ cert_item.id | default(cert_item.certificateId) }}"
+    subject_cns: "{{ cert_item.subjectCN | default([]) }}"
+    cn_primary: "{{ (cert_item.subjectCN | default(['unnamed']))[0] }}"
+    san_dns: "{{ cert_item.subjectAlternativeNamesByType.dNSName | default([]) }}"
+    app_id: >-
+      {{
+        (cert_item.instances | default([]) | map(attribute='applicationIds') | list | first | default([]) | first)
+      }}
+    app_obj: "{{ apps_by_id.get(app_id, {}) }}"
+    issuing_template_id: >-
+      {{
+        issuing_template_id_override
+        | default( (app_obj.certificateIssuingTemplateAliasIdMap | default({})).values() | list | first, true)
+      }}
+
+- name: Guard minimal inputs
+  ansible.builtin.assert:
+    that:
+      - cert_id is defined
+      - app_id is defined
+      - issuing_template_id is defined
+    fail_msg: "Missing cert_id/app_id/issuing_template_id for {{ cn_primary }}"
+
+- name: Per-cert work dir
+  ansible.builtin.file:
+    path: "{{ work_dir }}/{{ cert_id }}"
+    state: directory
+    mode: "0700"
+
+- name: Generate new private key
+  community.crypto.openssl_privatekey:
+    path: "{{ work_dir }}/{{ cert_id }}/key.pem"
+    size: 2048
+    type: RSA
+    mode: "0600"
+
+- name: Create CSR (reuse CN/SANs)
+  community.crypto.openssl_csr:
+    path: "{{ work_dir }}/{{ cert_id }}/req.csr"
+    privatekey_path: "{{ work_dir }}/{{ cert_id }}/key.pem"
+    common_name: "{{ cn_primary }}"
+    subject_alt_name: "{{ san_dns | map('regex_replace','^(.*)$','DNS:\\1') | list }}"
+    mode: "0644"
+
+- name: Read CSR text
+  ansible.builtin.slurp:
+    path: "{{ work_dir }}/{{ cert_id }}/req.csr"
+  register: csr_slurp
+
+- name: Submit renewal
+  ansible.builtin.uri:
+    url: "{{ global_api_url }}/v1/certificaterequests"
+    method: POST
+    headers:
+      accept: "application/json"
+      tppl-api-key: "{{ vaas_api_key }}"
+      content-type: "application/json"
+    body_format: json
+    body:
+      certificateOwnerUserId: null
+      certificateSigningRequest: "{{ (csr_slurp.content | b64decode) | replace('\n','\\n') }}"
+      applicationId: "{{ app_id }}"
+      certificateIssuingTemplateId: "{{ issuing_template_id }}"
+      existingCertificateId: "{{ cert_id }}"
+    status_code: [200, 201]
+    return_content: true
+  register: renew_resp
+
+- name: Capture request id
+  ansible.builtin.set_fact:
+    request_id: "{{ (renew_resp.json.certificateRequests | default([]) | first).id }}"
+
+- name: Poll status until ISSUED (or end state)
+  ansible.builtin.uri:
+    url: "{{ global_api_url }}/v1/certificaterequests/{{ request_id }}"
+    method: GET
+    headers:
+      accept: "application/json"
+      tppl-api-key: "{{ vaas_api_key }}"
+    status_code: 200
+    return_content: true
+  register: poll
+  until: "(poll.json.status | default('PENDING')) in ['ISSUED','FAILED','REJECTED']"
+  retries: "{{ (poll_timeout_sec // poll_interval_sec) | int }}"
+  delay: "{{ poll_interval_sec }}"
+
+- name: Fail if issuance failed
+  ansible.builtin.fail:
+    msg: "Renewal for {{ cn_primary }} ended in status {{ poll.json.status }}"
+  when: poll.json.status != 'ISSUED'
+
+- name: New certificate id
+  ansible.builtin.set_fact:
+    new_cert_id: "{{ (poll.json.certificateIds | default([]) | first) }}"
+
+- name: Download renewed certificate (PEM)
+  ansible.builtin.uri:
+    url: "{{ global_api_url }}/v1/certificates/{{ new_cert_id }}/contents?format=PEM"
+    method: GET
+    headers:
+      accept: "application/json"
+      tppl-api-key: "{{ vaas_api_key }}"
+    return_content: true
+    status_code: 200
+  register: pem_resp
+
+- name: Save renewed cert
+  ansible.builtin.copy:
+    dest: "{{ work_dir }}/{{ cert_id }}/cert.pem"
+    content: "{{ (pem_resp.json.certificate | default(pem_resp.content | b64decode)) }}"
+    mode: "0644"
+
+- name: Optional deploy to Linux targets
+  when: deploy_enabled | bool
+  block:
+    - name: Push key
+      ansible.builtin.copy:
+        src: "{{ work_dir }}/{{ cert_id }}/key.pem"
+        dest: "{{ deploy_key_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups[deploy_group] | default([]) }}"
+
+    - name: Push cert
+      ansible.builtin.copy:
+        src: "{{ work_dir }}/{{ cert_id }}/cert.pem"
+        dest: "{{ deploy_cert_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      delegate_to: "{{ item }}"
+      loop: "{{ groups[deploy_group] | default([]) }}"
+
+    - name: Reload service (optional)
+      ansible.builtin.service:
+        name: "{{ service_to_reload }}"
+        state: reloaded
+      when: service_to_reload | length > 0
+      delegate_to: "{{ item }}"
+      loop: "{{ groups[deploy_group] | default([]) }}"
+
+- name: Report success
+  ansible.builtin.debug:
+    msg:
+      cn: "{{ cn_primary }}"
+      old_cert_id: "{{ cert_id }}"
+      new_cert_id: "{{ new_cert_id }}"
+      saved_to: "{{ work_dir }}/{{ cert_id }}"
