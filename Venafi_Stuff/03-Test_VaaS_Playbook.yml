@@ -93,13 +93,13 @@
       ansible.builtin.debug:
         msg: "{{ vaas_parsed_certs.certificates | map(attribute='certificateName') | list }}"
 
-    # Optional: show expiring soon (example: <= 30 days). Adjust as you like.
-#    - name: Compute 'expiring within 30 days' subset (best-effort)
-#      ansible.builtin.set_fact:
-#        expiring_soon: >-
-#          {{
-#            (vaas_parsed_certs.certificates | default([]))
-#            | selectattr('validTo', 'defined')
-#            | selectattr('validTo', 'search', '.*')    # keep those with a value
-#            | list
-#          }}
+    # Optional: show expiring soon (example: <= 7 days). Adjust as you like.
+    - name: Compute 'expiring within 7 days' subset (best-effort)
+      ansible.builtin.set_fact:
+        expiring_soon: >-
+          {{
+            (vaas_parsed_certs.certificates | default([]))
+            | selectattr('validTo', 'defined')
+            | selectattr('validTo', 'search', '.*')    # keep those with a value
+            | list
+          }}
