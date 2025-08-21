@@ -22,11 +22,11 @@
     vaas_no_log: true                         # Flip to false only when debugging
 
     # Local (controller/EE) work dir for Venafi artifacts (module runs on localhost)
-    # These are “templates” — we’ll resolve/validate them into concrete strings.
     vaas_work_dir_tpl: "/tmp/venafi/{{ inventory_hostname }}"
     vaas_key_file_tpl:   "{{ vaas_work_dir_tpl }}/{{ inventory_hostname }}.key"
     vaas_cert_file_tpl:  "{{ vaas_work_dir_tpl }}/{{ inventory_hostname }}.crt"
     vaas_chain_file_tpl: "{{ vaas_work_dir_tpl }}/{{ inventory_hostname }}-chain.crt"
+    vaas_csr_file_tpl:   "{{ vaas_work_dir_tpl }}/{{ inventory_hostname }}.csr"
 
     # Safety net: only run against these two hosts
     approved_hosts:
@@ -59,19 +59,20 @@
           - vaas_api_key_resolved | length > 10
         fail_msg: "Missing API key. Attach Controller credential var 'vaas_api_key' or set VAAS_API_KEY."
 
-    # ---------- Resolve CN/SANs now ----------
+    # ---------- Resolve CN/SANs ----------
     - name: Determine hostnames for certificate SANs
       ansible.builtin.set_fact:
         _cn: "{{ ansible_facts.fqdn | default(inventory_hostname) }}"
         _short: "{{ (ansible_facts.fqdn | default(inventory_hostname)).split('.')[0] }}"
 
-    # ---------- Resolve all path strings eagerly (avoid None) ----------
+    # ---------- Resolve all path strings eagerly ----------
     - name: Resolve Venafi local work/artifact paths (controller side)
       ansible.builtin.set_fact:
         vaas_work_dir: "{{ vaas_work_dir_tpl }}"
         vaas_key_file: "{{ vaas_key_file_tpl }}"
         vaas_cert_file: "{{ vaas_cert_file_tpl }}"
         vaas_chain_file: "{{ vaas_chain_file_tpl }}"
+        vaas_csr_file: "{{ vaas_csr_file_tpl }}"
 
     - name: Validate Venafi paths are concrete strings (not None/empty)
       ansible.builtin.assert:
@@ -80,10 +81,12 @@
           - vaas_key_file is string
           - vaas_cert_file is string
           - vaas_chain_file is string
+          - vaas_csr_file is string
           - vaas_work_dir | length > 0
           - vaas_key_file | length > 0
           - vaas_cert_file | length > 0
           - vaas_chain_file | length > 0
+          - vaas_csr_file | length > 0
         fail_msg: "One or more VaaS file paths are missing. Check vaas_work_dir/_file variables."
 
   tasks:
@@ -128,7 +131,7 @@
         state: directory
         mode: "0700"
 
-    - name: Request/renew certificate from VaaS (explicit file paths)
+    - name: Request/renew certificate from VaaS (explicit file paths incl CSR)
       block:
         - name: Venafi request
           delegate_to: localhost
@@ -143,6 +146,7 @@
             alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"   # comma-separated SANs
             # Generate CSR/key locally so we actually get the private key
             csr_origin: local
+            csr_path: "{{ vaas_csr_file }}"              # <-- REQUIRED due to module bug
             privatekey_type: "{{ vaas_key_type }}"
             privatekey_size: "{{ vaas_key_size }}"
             privatekey_reuse: true
@@ -265,5 +269,5 @@
           - "CN: {{ _cn }} | SANs: {{ _cn }}, {{ _short }}"
           - "Port 9090 listening: {{ 'yes' if (ss_out.stdout is search('(:|\\])9090\\b')) else 'no' }}"
           - "HTTPS probe status: {{ cockpit_http.status | default('n/a') }}"
-          - "Cert path: /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.cert"
-          - "Key  path: /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.key"
+          - "Cert path (target): /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.cert"
+          - "Key  path (target): /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.key"
