@@ -113,3 +113,61 @@
       rescue:
         - ansible.builtin.debug:
             msg: "At least one renewal failed; see prior errors."
+
+
+
+# --- PLAY 2: reach (and optionally deploy to) AWS web servers over SSH ---
+- name: Reach & (optional) deploy to AWS web servers (SSH)
+  hosts: aws_ec2
+  gather_facts: false
+  vars:
+    # If not set in group_vars/aws_ec2.yml, set here:
+    ansible_user: ec2-user
+    # become: true   # uncomment if you’ll write to /etc
+    # become_method: sudo
+
+    # Pull values from the localhost play:
+    expiring_list: "{{ hostvars['localhost']['expiring_soon'] | default([]) }}"
+    work_dir_ctrl: "{{ hostvars['localhost']['work_dir'] | default('/tmp/vaas_day7_or_less') }}"
+    deploy_enabled_ctrl: "{{ hostvars['localhost']['deploy_enabled'] | default(false) | bool }}"
+    deploy_cert_path_ctrl: "{{ hostvars['localhost']['deploy_cert_path'] | default('/etc/pki/tls/certs/{{ item.subjectCN[0] }}.crt') }}"
+    deploy_key_path_ctrl:  "{{ hostvars['localhost']['deploy_key_path']  | default('/etc/pki/tls/private/{{ item.subjectCN[0] }}.key') }}"
+    service_to_reload_ctrl: "{{ hostvars['localhost']['service_to_reload'] | default('') }}"
+
+  tasks:
+    - name: Connectivity check
+      ansible.builtin.ping:
+
+    - name: Stop if deploy not enabled
+      ansible.builtin.meta: end_play
+      when: not deploy_enabled_ctrl
+
+    - name: Copy renewed cert to target
+      ansible.builtin.copy:
+        src: "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.crt"   # file created by renew step on controller
+        dest: "{{ deploy_cert_path_ctrl }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ expiring_list }}"
+      loop_control:
+        label: "{{ item.subjectCN[0] }}"
+      # Optional safety: only deploy when this host matches CN or a SAN you expect
+      # when: inventory_hostname is search(item.subjectCN[0])
+
+    - name: Copy renewed key to target
+      ansible.builtin.copy:
+        src: "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.key"
+        dest: "{{ deploy_key_path_ctrl }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ expiring_list }}"
+      loop_control:
+        label: "{{ item.subjectCN[0] }}"
+
+    - name: Reload service if requested
+      ansible.builtin.service:
+        name: "{{ service_to_reload_ctrl }}"
+        state: reloaded
+      when: service_to_reload_ctrl | length > 0
