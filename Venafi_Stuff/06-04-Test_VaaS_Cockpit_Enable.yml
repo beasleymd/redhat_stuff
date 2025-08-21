@@ -61,7 +61,7 @@
         that:
           - vaas_zone is string
           - vaas_zone | length > 0
-          - "vaas_zone is search('\\\\')"
+          - "'\\' in vaas_zone"
         fail_msg: "vaas_zone must be a non-empty VaaS path using backslashes, e.g. 'Applications\\Server-TLS'."
 
   tasks:
