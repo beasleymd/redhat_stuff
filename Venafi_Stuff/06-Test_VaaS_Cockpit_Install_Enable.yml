@@ -16,8 +16,8 @@
     cockpit_basename: "10-cockpit"
 
     # ----- Venafi as a Service (VaaS) settings -----
-    # Controller injects this variable from your Credential. Do NOT self-reference it.
-    vaas_api_key: "{{ vaas_api_key }}"
+    # Controller injects a variable named 'vaas_api_key' via Credential.
+    # Do NOT self-reference it here; we resolve it in pre_tasks.
     vaas_zone: "Applications/Server-TLS"   # adjust to your tenant policy/zone
     vaas_key_type: "RSA"
     vaas_key_size: 2048
@@ -37,16 +37,20 @@
     - name: Ensure RHEL 9+
       ansible.builtin.assert:
         that:
-          - ansible_facts['os_family'] == "RedHat"
-          - (ansible_facts['distribution_major_version'] | int) >= 9
+          - ansible_facts.os_family == "RedHat"
+          - (ansible_facts.distribution_major_version | int) >= 9
         fail_msg: "This playbook is intended for RHEL 9+ only."
+
+    - name: Resolve VaaS API key from Controller credential or env (no self-reference)
+      ansible.builtin.set_fact:
+        vaas_api_key_resolved: "{{ vaas_api_key | default(lookup('env','VAAS_API_KEY'), true) }}"
 
     - name: Validate VaaS API key present
       ansible.builtin.assert:
         that:
-          - vaas_api_key is defined
-          - vaas_api_key | length > 10
-        fail_msg: "Missing vaas_api_key. Attach your Controller credential to the Job Template."
+          - vaas_api_key_resolved is defined
+          - vaas_api_key_resolved | length > 10
+        fail_msg: "Missing API key. Attach your Controller credential (var 'vaas_api_key') or set VAAS_API_KEY."
 
   tasks:
     # ------------------ Cockpit installation & enablement ------------------
@@ -91,15 +95,14 @@
       delegate_to: localhost
       become: false
       venafi.machine_identity.venafi_certificate:
-        # Use 'token' for widest compatibility across collection versions
-        token: "{{ vaas_api_key }}"
+        # Use 'token' for broad compatibility across collection versions
+        token: "{{ vaas_api_key_resolved }}"
         zone: "{{ vaas_zone }}"
         common_name: "{{ _cn }}"
-        # Module expects a comma-separated string of DNS SANs
+        # Comma-separated DNS SANs string
         alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"
         privatekey_type: "{{ vaas_key_type }}"
         privatekey_size: "{{ vaas_key_size }}"
-        # Ask for chain in the returned cert bundle
         chain_option: last
         pickup_timeout: "{{ vaas_pickup_timeout }}"
       register: vaas_result
@@ -137,25 +140,4 @@
 
     - name: Verify Cockpit is listening on 9090
       ansible.builtin.command: "ss -lnt"
-      register: ss_out
-      changed_when: false
-
-    - name: Probe Cockpit over HTTPS (401 expected without auth)
-      ansible.builtin.uri:
-        url: "https://{{ _cn }}:9090"
-        method: GET
-        validate_certs: false
-        status_code: [200, 301, 302, 401]
-      register: cockpit_http
-      changed_when: false
-
-  post_tasks:
-    - name: Summary
-      ansible.builtin.debug:
-        msg:
-          - "Host: {{ inventory_hostname }}"
-          - "CN: {{ _cn }} | SANs: {{ _cn }}, {{ _short }}"
-          - "Port 9090 listening: {{ 'yes' if (ss_out.stdout is search('(:|\\])9090\\b')) else 'no' }}"
-          - "HTTPS probe status: {{ cockpit_http.status | default('n/a') }}"
-          - "Cert path: /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.cert"
-          - "Key  path: /etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.key"
+      regist
