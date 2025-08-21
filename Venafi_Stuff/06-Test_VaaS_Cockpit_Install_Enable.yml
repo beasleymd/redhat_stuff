@@ -1,8 +1,5 @@
 ---
 # Cockpit + Venafi as a Service (VaaS) on RHEL 9 (AWS)
-# Inventory: "mbredeme - AWS Running Inventory"
-# Group:     "aws_ec2"
-# Hosts:     ec2-44-205-109-76.compute-1.amazonaws.com, ec2-54-174-32-162.compute-1.amazonaws.com
 
 - name: Install Cockpit and deploy VaaS TLS certs
   hosts: aws_ec2
@@ -19,10 +16,9 @@
     cockpit_basename: "10-cockpit"
 
     # ----- Venafi as a Service (VaaS) settings -----
-    # Provide this via AAP "Secret Text" credential or extra var:
-    # -e vaas_api_key=XXXXX or set a Controller credential variable
-    vaas_api_key: "{{ vaas_api_key | default(lookup('env','VAAS_API_KEY'), true) }}"
-    vaas_zone: "Applications/Server-TLS"   # <-- adjust to your tenant policy/zone
+    # Controller injects this variable from your Credential. Do NOT self-reference it.
+    vaas_api_key: "{{ vaas_api_key }}"
+    vaas_zone: "Applications/Server-TLS"   # adjust to your tenant policy/zone
     vaas_key_type: "RSA"
     vaas_key_size: 2048
     vaas_pickup_timeout: 300
@@ -35,7 +31,7 @@
   pre_tasks:
     - name: Ensure target host is approved (use --limit to override if desired)
       ansible.builtin.assert:
-        that: "'{{ inventory_hostname }}' in approved_hosts"
+        that: inventory_hostname in approved_hosts
         fail_msg: "This playbook is restricted to the two specified EC2 hosts."
 
     - name: Ensure RHEL 9+
@@ -47,8 +43,10 @@
 
     - name: Validate VaaS API key present
       ansible.builtin.assert:
-        that: vaas_api_key is defined and vaas_api_key | length > 10
-        fail_msg: "Missing vaas_api_key. Provide via AAP credential or extra var."
+        that:
+          - vaas_api_key is defined
+          - vaas_api_key | length > 10
+        fail_msg: "Missing vaas_api_key. Attach your Controller credential to the Job Template."
 
   tasks:
     # ------------------ Cockpit installation & enablement ------------------
@@ -84,25 +82,25 @@
         immediate: true
 
     # ------------------ Request TLS cert from VaaS (per-host) ------------------
-    # We delegate the API call to localhost (Controller/EE) but keep host scoping.
     - name: Determine hostnames for certificate SANs
       ansible.builtin.set_fact:
-        _cn: "{{ ansible_facts['fqdn'] | default(inventory_hostname) }}"
-        _short: "{{ (ansible_facts['fqdn'] | default(inventory_hostname)).split('.')[0] }}"
+        _cn: "{{ ansible_facts.fqdn | default(inventory_hostname) }}"
+        _short: "{{ (ansible_facts.fqdn | default(inventory_hostname)).split('.')[0] }}"
 
     - name: Request or renew certificate from VaaS for this host
       delegate_to: localhost
       become: false
       venafi.machine_identity.venafi_certificate:
-        api_key: "{{ vaas_api_key }}"
+        # Use 'token' for widest compatibility across collection versions
+        token: "{{ vaas_api_key }}"
         zone: "{{ vaas_zone }}"
         common_name: "{{ _cn }}"
-        subject_alt_name:
-          - "DNS:{{ _cn }}"
-          - "DNS:{{ _short }}"
-        key_type: "{{ vaas_key_type }}"
-        key_size: "{{ vaas_key_size }}"
-        chain: true
+        # Module expects a comma-separated string of DNS SANs
+        alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"
+        privatekey_type: "{{ vaas_key_type }}"
+        privatekey_size: "{{ vaas_key_size }}"
+        # Ask for chain in the returned cert bundle
+        chain_option: last
         pickup_timeout: "{{ vaas_pickup_timeout }}"
       register: vaas_result
       no_log: true  # protect key material in logs
@@ -122,7 +120,7 @@
         mode: "0600"
       no_log: true
 
-    - name: Install certificate chain for Cockpit (leaf + intermediates)
+    - name: Install certificate (leaf + chain) for Cockpit
       ansible.builtin.copy:
         dest: "/etc/cockpit/ws-certs.d/{{ cockpit_basename }}.{{ _cn }}.cert"
         content: "{{ vaas_result.certificate }}"
@@ -147,7 +145,7 @@
         url: "https://{{ _cn }}:9090"
         method: GET
         validate_certs: false
-        status_code: 200,301,302,401
+        status_code: [200, 301, 302, 401]
       register: cockpit_http
       changed_when: false
 
