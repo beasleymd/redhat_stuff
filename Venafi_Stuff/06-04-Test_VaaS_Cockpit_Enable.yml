@@ -1,5 +1,5 @@
 ---
-# Cockpit + Venafi as a Service (VaaS) on RHEL 9 (AWS) — with preflight
+# Cockpit + Venafi as a Service (VaaS) on RHEL 9 (AWS)
 
 - name: Install Cockpit and deploy VaaS TLS certs
   hosts: aws_ec2
@@ -12,28 +12,27 @@
       - cockpit
       - cockpit-system
     firewall_zone: public
-    cockpit_basename: "10-cockpit"   # Cockpit loads the last *.cert alphabetically
+    cockpit_basename: "10-cockpit"   # Cockpit prefers the last *.cert alphabetically
 
-    # ----- VaaS settings -----
-    vaas_zone: "Applications\\Server-TLS"   # MUST use backslashes for VaaS paths
+    # ----- Venafi as a Service (VaaS) settings -----
+    vaas_zone: "Applications\\Server-TLS"   # VaaS uses backslashes; escape in YAML
     vaas_key_type: "RSA"
     vaas_key_size: 2048
+    vaas_no_log: true
     vaas_url: "https://api.venafi.cloud"
-    vaas_no_log: true   # set to false only when debugging (then remove secrets from logs!)
 
-    # Local (controller/EE) working dir for artifacts (module runs on localhost)
+    # Local (controller/EE) work dir for Venafi artifacts (module runs on localhost)
     vaas_work_dir: "/tmp/venafi/{{ inventory_hostname }}"
     vaas_key_file:   "{{ vaas_work_dir }}/{{ inventory_hostname }}.key"
     vaas_cert_file:  "{{ vaas_work_dir }}/{{ inventory_hostname }}.crt"
     vaas_chain_file: "{{ vaas_work_dir }}/{{ inventory_hostname }}-chain.crt"
 
-    # Optional: limit which hosts this playbook can run on
+    # Safety net: only run against these two hosts
     approved_hosts:
       - ec2-44-205-109-76.compute-1.amazonaws.com
       - ec2-54-174-32-162.compute-1.amazonaws.com
 
   pre_tasks:
-    # ---------- Guardrails ----------
     - name: Ensure target host is approved (use --limit to override if desired)
       ansible.builtin.assert:
         that: inventory_hostname in approved_hosts
@@ -46,8 +45,7 @@
           - (ansible_facts.distribution_major_version | int) >= 9
         fail_msg: "This playbook is intended for RHEL 9+ only."
 
-    # ---------- API key resolution (no self-reference) ----------
-    - name: Resolve VaaS API key from Controller credential or env
+    - name: Resolve VaaS API key from Controller credential or env (no self-reference)
       ansible.builtin.set_fact:
         vaas_api_key_resolved: "{{ vaas_api_key | default(lookup('env','VAAS_API_KEY'), true) }}"
 
@@ -58,61 +56,13 @@
           - vaas_api_key_resolved | length > 10
         fail_msg: "Missing API key. Attach your Controller credential (var 'vaas_api_key') or set VAAS_API_KEY."
 
-    - name: Validate zone string looks like a VaaS path
+    - name: Validate zone string looks like a VaaS path (must contain backslash)
       ansible.builtin.assert:
         that:
           - vaas_zone is string
           - vaas_zone | length > 0
-          - '\\' in vaas_zone
+          - "vaas_zone is search('\\\\')"
         fail_msg: "vaas_zone must be a non-empty VaaS path using backslashes, e.g. 'Applications\\Server-TLS'."
-
-    # ---------- PRE-FLIGHT borrowed from playbook #1 (uri + parsing) ----------
-    - name: Preflight — check token works and VaaS reachable
-      ansible.builtin.uri:
-        url: "{{ vaas_url }}/outagedetection/v1/applications?ownerDetails=false&ownershipCheck=false&issuingTemplateAssigned=false&ownershipTree=false"
-        method: GET
-        headers:
-          accept: "application/json"
-          tppl-api-key: "{{ vaas_api_key_resolved }}"
-        return_content: true
-        status_code: 200
-      register: _pre_apps
-
-    - name: Parse preflight apps JSON (prefer .json, fallback to .content)
-      ansible.builtin.set_fact:
-        _pre_apps_parsed: "{{ _pre_apps.json | default(_pre_apps.content | from_json) }}"
-
-    # ---------- Derive CN / SANs now (we’ll reuse for reporting and request) ----------
-    - name: Determine hostnames for certificate SANs
-      ansible.builtin.set_fact:
-        _cn: "{{ ansible_facts.fqdn | default(inventory_hostname) }}"
-        _short: "{{ (ansible_facts.fqdn | default(inventory_hostname)).split('.')[0] }}"
-
-    # ---------- Optional visibility: show VaaS’s current view of certs ----------
-    - name: Preflight — fetch known certificates (optional visibility)
-      ansible.builtin.uri:
-        url: "{{ vaas_url }}/outagedetection/v1/certificates?ownershipTree=false&excludeSupersededInstances=false&limit=200"
-        method: GET
-        headers:
-          accept: "application/json"
-          tppl-api-key: "{{ vaas_api_key_resolved }}"
-        return_content: true
-        status_code: 200
-      register: _pre_certs
-
-    - name: Parse certs JSON
-      ansible.builtin.set_fact:
-        _pre_certs_parsed: "{{ _pre_certs.json | default(_pre_certs.content | from_json) }}"
-
-    - name: (Optional) Show any certs VaaS already has for this host
-      ansible.builtin.debug:
-        msg: >-
-          {{
-            (_pre_certs_parsed.certificates | default([]))
-            | selectattr('subjectCN','search', _cn | regex_escape)
-            | map(attribute='certificateName')
-            | list
-          }}
 
   tasks:
     # ------------------ Cockpit installation & enablement ------------------
@@ -147,8 +97,13 @@
         state: enabled
         immediate: true
 
-    # ------------------ Venafi request (module) ------------------
-    - name: Create local Venafi work directory on controller
+    # ------------------ Request TLS cert from VaaS (per-host) ------------------
+    - name: Determine hostnames for certificate SANs
+      ansible.builtin.set_fact:
+        _cn: "{{ ansible_facts.fqdn | default(inventory_hostname) }}"
+        _short: "{{ (ansible_facts.fqdn | default(inventory_hostname)).split('.')[0] }}"
+
+    - name: Create local Venafi work directory
       delegate_to: localhost
       become: false
       ansible.builtin.file:
@@ -156,36 +111,31 @@
         state: directory
         mode: "0700"
 
-    - name: Request or renew certificate from VaaS (explicit file paths; no pickup_timeout)
+    - name: Request or renew certificate from VaaS for this host (explicit file paths)
       block:
         - name: Venafi request
           delegate_to: localhost
           become: false
           venafi.machine_identity.venafi_certificate:
-            # Auth + endpoint
             token: "{{ vaas_api_key_resolved }}"
             url: "{{ vaas_url }}"
-            # Zone + subject
             zone: "{{ vaas_zone }}"
             common_name: "{{ _cn }}"
-            alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"   # comma-separated SANs with DNS: prefix
-            # Generate CSR/key locally so we actually get the private key
+            alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"
             csr_origin: local
             privatekey_type: "{{ vaas_key_type }}"
             privatekey_size: "{{ vaas_key_size }}"
             privatekey_reuse: true
-            # REQUIRED by your module version: explicit file paths on localhost
             path: "{{ vaas_work_dir }}"
             privatekey_path: "{{ vaas_key_file }}"
             cert_path: "{{ vaas_cert_file }}"
             chain_path: "{{ vaas_chain_file }}"
-            # Chain formatting & desired state
             chain_option: last
             state: present
           register: vaas_result
           no_log: "{{ vaas_no_log }}"
       rescue:
-        - name: Show sanitized Venafi failure details (module threw an error)
+        - name: Show sanitized Venafi failure details
           no_log: false
           vars:
             _fail: "{{ ansible_failed_result | default({}) }}"
@@ -229,7 +179,7 @@
       register: _slurp_chain
       no_log: true
 
-    - name: Combine leaf + chain (text)
+    - name: Build combined cert content (leaf + chain)
       ansible.builtin.set_fact:
         _cert_bundle_text: >-
           {{
@@ -241,7 +191,7 @@
               )
           }}
 
-    - name: Ensure Cockpit cert directory exists
+    - name: Create Cockpit certs directory
       ansible.builtin.file:
         path: /etc/cockpit/ws-certs.d
         state: directory
