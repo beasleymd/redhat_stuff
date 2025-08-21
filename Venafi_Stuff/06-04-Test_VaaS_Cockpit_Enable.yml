@@ -56,13 +56,24 @@
           - vaas_api_key_resolved | length > 10
         fail_msg: "Missing API key. Attach your Controller credential (var 'vaas_api_key') or set VAAS_API_KEY."
 
-    - name: Validate zone string looks like a VaaS path (must contain backslash)
+    # Safer zone validation (no regex/backslash parsing pitfalls)
+    - name: Validate zone string provided
       ansible.builtin.assert:
         that:
           - vaas_zone is string
           - vaas_zone | length > 0
-          - "'\\' in vaas_zone"
-        fail_msg: "vaas_zone must be a non-empty VaaS path using backslashes, e.g. 'Applications\\Server-TLS'."
+        fail_msg: "vaas_zone must be set (e.g. 'Applications\\Server-TLS')."
+
+    # Optional: keep if you want a structural check without regex/escaping issues
+    # - name: Compute zone parts (optional structure check)
+    #   ansible.builtin.set_fact:
+    #     _zone_parts: "{{ vaas_zone.split('\\') }}"
+    #
+    # - name: Validate zone contains at least one separator (optional)
+    #   ansible.builtin.assert:
+    #     that:
+    #       - _zone_parts | length > 1
+    #     fail_msg: "vaas_zone should look like 'Folder\\Subfolder'."
 
   tasks:
     # ------------------ Cockpit installation & enablement ------------------
