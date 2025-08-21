@@ -12,19 +12,14 @@
       - cockpit
       - cockpit-system
     firewall_zone: public
-    # Cockpit picks the last *.cert alphabetically; use a prefix > 0
-    cockpit_basename: "10-cockpit"
+    cockpit_basename: "10-cockpit"   # Cockpit prefers the last *.cert alphabetically
 
     # ----- Venafi as a Service (VaaS) settings -----
-    # Controller injects 'vaas_api_key' via Credential. We resolve it in pre_tasks.
-    # NOTE: In VaaS, policy/zone paths use BACKSLASH separators -> escape in YAML.
-    vaas_zone: "Applications\\Server-TLS"   # adjust to your tenant policy/zone
+    vaas_zone: "Applications\\Server-TLS"   # VaaS uses backslashes; escape in YAML
     vaas_key_type: "RSA"
     vaas_key_size: 2048
     vaas_pickup_timeout: 300
-
-    # Toggle to reveal/full-hide module output while troubleshooting
-    vaas_no_log: true
+    vaas_no_log: true  # flip to false only when debugging
 
     # Safety net: only run against these two hosts
     approved_hosts:
@@ -100,12 +95,10 @@
           delegate_to: localhost
           become: false
           venafi.machine_identity.venafi_certificate:
-            # Use 'token' for broad compatibility across collection versions
             token: "{{ vaas_api_key_resolved }}"
             zone: "{{ vaas_zone }}"
             common_name: "{{ _cn }}"
-            # Comma-separated DNS SANs string
-            alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"
+            alt_name: "DNS:{{ _cn }},DNS:{{ _short }}"   # comma-separated SANs
             privatekey_type: "{{ vaas_key_type }}"
             privatekey_size: "{{ vaas_key_size }}"
             chain_option: last
