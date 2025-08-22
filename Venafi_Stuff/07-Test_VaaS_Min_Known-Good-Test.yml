@@ -1,0 +1,100 @@
+---
+# Play 1: Request/obtain cert from VaaS on the controller
+- name: Request TLS cert from Venafi TLS Protect Cloud
+  hosts: localhost
+  gather_facts: false
+  vars:
+    vaas_api_key: "{{ lookup('env', 'VAASTOKEN') | default(venafi_api_key, true) }}"
+    vaas_api_url: "https://api.venafi.cloud"
+    zone: "MyApp\\MyIssuingTemplate"   # <-- EXACT names from VaaS; note the double backslash
+    common_name: "cockpit.example.internal"
+    key_algo: "RSA"
+    key_size: 2048
+    out_dir: "/tmp/vaas_demo"
+  collections:
+    - venafi.machine_identity
+
+  tasks:
+    - name: Ensure work dir exists
+      ansible.builtin.file:
+        path: "{{ out_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Request certificate from VaaS
+      venafi.machine_identity.venafi_certificate:
+        connection: cloud
+        url: "{{ vaas_api_url }}"
+        token: "{{ vaas_api_key }}"
+        zone: "{{ zone }}"
+        common_name: "{{ common_name }}"
+        san_dns: ["{{ common_name }}"]
+        algorithm: "{{ key_algo }}"
+        key_size: "{{ key_size }}"
+        chain_option: "RootFirst"
+        pickup: true              # wait for issuance
+        timeout: 300
+        state: present
+        # Save to controller first
+        privatekey_path: "{{ out_dir }}/{{ common_name }}.key"
+        certificate_path: "{{ out_dir }}/{{ common_name }}.crt"
+        chain_path: "{{ out_dir }}/{{ common_name }}-chain.crt"
+      register: vaas_result
+      # Remove any when: filters during testing
+
+    - name: Show VaaS response (debug)
+      ansible.builtin.debug:
+        var: vaas_result
+
+# Play 2: Deploy to AWS hosts
+- name: Deploy certs to RHEL9 AWS instances
+  hosts: aws_ec2
+  become: true
+  gather_facts: false
+  vars:
+    common_name: "cockpit.example.internal"
+    src_dir: "/tmp/vaas_demo"
+    cert_path: "/etc/pki/tls/certs/{{ common_name }}.crt"
+    key_path:  "/etc/pki/tls/private/{{ common_name }}.key"
+    chain_path: "/etc/pki/ca-trust/source/anchors/{{ common_name }}-chain.crt"
+
+  tasks:
+    - name: Copy private key
+      ansible.builtin.copy:
+        src: "{{ src_dir }}/{{ common_name }}.key"
+        dest: "{{ key_path }}"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Copy certificate
+      ansible.builtin.copy:
+        src: "{{ src_dir }}/{{ common_name }}.crt"
+        dest: "{{ cert_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install chain into trust anchors
+      ansible.builtin.copy:
+        src: "{{ src_dir }}/{{ common_name }}-chain.crt"
+        dest: "{{ chain_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Update trust
+      ansible.builtin.command: update-ca-trust
+      changed_when: true
+
+    - name: (Optional) Configure Cockpit to use the new cert
+      ansible.builtin.copy:
+        dest: /etc/cockpit/ws-certs.d/0-self-signed.cert
+        content: |
+          {{ lookup('file', cert_path) | trim }}
+          {{ lookup('file', key_path) | trim }}
+
+    - name: Restart Cockpit
+      ansible.builtin.service:
+        name: cockpit
+        state: restarted
