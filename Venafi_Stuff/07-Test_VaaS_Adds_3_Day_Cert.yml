@@ -1,0 +1,160 @@
+---
+# Play 1: Find certs expiring in ≤ 3 days; issue new ones via Venafi module
+- name: Renew certs expiring in ≤ 3 days and stage on controller
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - venafi.machine_identity
+
+  vars:
+    # === Required ===
+    vaas_api_key: "{{ venafi_api_key }}"
+    vaas_api_url: "https://api.venafi.cloud"
+    # Zone is Application\IssuingTemplate (escape the backslash in YAML)
+    zone: "MyApplication\\MyIssuingTemplate"
+
+    # === Tuning ===
+    page_size: 1000
+    work_dir: "/tmp/vaas_expiring3"
+    # Optional: set the CN you want if you’re targeting a single name; otherwise we use the CN from search results
+    # override_common_name: "app.internal.example"
+
+  pre_tasks:
+    - name: Ensure working dir exists
+      ansible.builtin.file:
+        path: "{{ work_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Assert API key present
+      ansible.builtin.assert:
+        that: [ vaas_api_key is defined, vaas_api_key | length > 0 ]
+        fail_msg: "Set venafi_api_key (AAP var/credential)."
+
+  tasks:
+    # --- search for certs expiring in ≤ 3 days
+    - name: Compute window (UTC)
+      ansible.builtin.set_fact:
+        now_iso: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        plus3_iso: "{{ lookup('pipe','date -u -d +3days +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Search expiring (ACTIVE) certs via VaaS certificatesearch
+      ansible.builtin.uri:
+        url: "{{ vaas_api_url }}/outagedetection/v1/certificatesearch"
+        method: POST
+        headers:
+          accept: "application/json"
+          tppl-api-key: "{{ vaas_api_key }}"
+        body_format: json
+        body:
+          expression:
+            operands:
+              - { field: "certificateStatus", operator: "EQ",  value: "ACTIVE" }
+              - { field: "validityEnd",        operator: "GTE", value: "{{ now_iso }}" }
+              - { field: "validityEnd",        operator: "LTE", value: "{{ plus3_iso }}" }
+          ordering:
+            orders: [{ field: "validityEnd", direction: "ASC" }]
+          paging: { pageNumber: 0, pageSize: {{ page_size }} }
+        status_code: 200
+        return_content: true
+      register: cert_page
+
+    - name: Build expiring list
+      ansible.builtin.set_fact:
+        expiring_soon: "{{ (cert_page.json | default(cert_page.content | from_json)).certificates | default([]) }}"
+
+    - name: Stop if nothing to renew
+      ansible.builtin.meta: end_play
+      when: expiring_soon | length == 0
+
+    # --- for each expiring cert, request a new one using the module
+    - name: Issue new certs via venafi_certificate (pickup=true)
+      venafi.machine_identity.venafi_certificate:
+        connection: cloud
+        url: "{{ vaas_api_url }}"
+        token: "{{ vaas_api_key }}"
+        zone: "{{ zone }}"
+        # Use the CN from the expiring cert (or override if you set override_common_name)
+        common_name: "{{ override_common_name | default(item.subjectCN[0], true) }}"
+        # If you need SANs, add them here (safe default is CN only)
+        san_dns: ["{{ override_common_name | default(item.subjectCN[0], true) }}"]
+        algorithm: "RSA"
+        key_size: 2048
+        chain_option: "RootFirst"
+        pickup: true
+        timeout: 300
+        state: present
+        privatekey_path:  "{{ work_dir }}/{{ item.subjectCN[0] }}.key"
+        certificate_path: "{{ work_dir }}/{{ item.subjectCN[0] }}.crt"
+        chain_path:       "{{ work_dir }}/{{ item.subjectCN[0] }}-chain.crt"
+      loop: "{{ expiring_soon }}"
+      loop_control:
+        label: "{{ item.subjectCN[0] }}"
+
+# Play 2: Deploy to your RHEL9 AWS instances
+- name: Deploy renewed certs to RHEL9 AWS instances
+  hosts: aws_ec2
+  become: true
+  gather_facts: false
+  vars:
+    work_dir_ctrl: "{{ hostvars['localhost']['work_dir'] }}"
+    expiring_list: "{{ hostvars['localhost']['expiring_soon'] }}"
+    cert_dest:  "/etc/pki/tls/certs/{{ item.subjectCN[0] }}.crt"
+    key_dest:   "/etc/pki/tls/private/{{ item.subjectCN[0] }}.key"
+    chain_dest: "/etc/pki/ca-trust/source/anchors/{{ item.subjectCN[0] }}-chain.crt"
+    service_to_reload: ""     # e.g. nginx | httpd | haproxy (blank = skip)
+
+  tasks:
+    - name: Ensure destination dirs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "/etc/pki/tls/certs"
+        - "/etc/pki/tls/private"
+        - "/etc/pki/ca-trust/source/anchors"
+
+    - name: Copy private key
+      ansible.builtin.copy:
+        src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.key"
+        dest: "{{ key_dest }}"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ expiring_list }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
+
+    - name: Copy certificate
+      ansible.builtin.copy:
+        src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.crt"
+        dest: "{{ cert_dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ expiring_list }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
+
+    - name: Copy chain to trust anchors
+      ansible.builtin.copy:
+        src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}-chain.crt"
+        dest: "{{ chain_dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ expiring_list }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
+
+    - name: Restore SELinux contexts
+      ansible.builtin.command: "restorecon -Rv /etc/pki"
+      changed_when: true
+
+    - name: Update system trust store
+      ansible.builtin.command: "update-ca-trust"
+      changed_when: true
+
+    - name: Reload service if requested
+      ansible.builtin.service:
+        name: "{{ service_to_reload }}"
+        state: reloaded
+      when: service_to_reload | length > 0
