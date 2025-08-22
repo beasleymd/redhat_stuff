@@ -4,13 +4,6 @@
 # - Find ACTIVE certs in Venafi TLS Protect Cloud (VaaS) that expire in ≤ 3 days
 # - Issue fresh certs (using venafi_certificate) and stage them on the controller
 # - Deploy key/cert/chain to your RHEL9 AWS hosts in group "aws_ec2"
-#
-# Requirements:
-# - Execution Environment includes:
-#     - collection: venafi.machine_identity
-#     - python lib: vcert (module dependency)
-# - Set venafi_api_key in your Job Template credential/extra vars
-# - Set the correct "zone" (Application\\IssuingTemplate)
 
 # ----------------------
 # PLAY 1: Search + Issue
@@ -25,14 +18,14 @@
     # === Required ===
     vaas_api_key: "{{ venafi_api_key }}"
     vaas_api_url: "https://api.venafi.cloud"
-    # Zone is Application\IssuingTemplate (escape the backslash in YAML)
-    zone: "MyApplication\\MyIssuingTemplate"
+    # Zone is Application\IssuingTemplate (escape backslash in YAML)
+    zone: "AAP25DemoCrt\\AAP25DemoCertAPI"
 
     # === Tuning ===
     page_size: 1000
     work_dir: "/tmp/vaas_expiring3"
 
-    # Optional: override CN to a fixed name (normally we reuse CN from each expiring cert)
+    # Optional: override CN to a fixed name (normally reuse CN from each expiring cert)
     # override_common_name: "app.internal.example"
 
   pre_tasks:
@@ -65,6 +58,7 @@
         body_format: json
         body:
           expression:
+            operator: AND          # <-- REQUIRED (fixes your 503)
             operands:
               - field: "certificateStatus"
                 operator: "EQ"
@@ -81,10 +75,13 @@
                 direction: "ASC"
           paging:
             pageNumber: 0
-            pageSize: "{{ page_size | int }}"
+            pageSize: "{{ page_size | int }}"   # <-- keep numeric
         status_code: 200
         return_content: true
       register: cert_page
+      retries: 3
+      delay: 2
+      until: cert_page.status == 200
 
     - name: Build expiring list
       ansible.builtin.set_fact:
@@ -198,4 +195,3 @@
         name: "{{ service_to_reload }}"
         state: reloaded
       when: service_to_reload | length > 0
-
