@@ -55,8 +55,11 @@
               - { field: "validityEnd",        operator: "GTE", value: "{{ now_iso }}" }
               - { field: "validityEnd",        operator: "LTE", value: "{{ plus3_iso }}" }
           ordering:
-            orders: [{ field: "validityEnd", direction: "ASC" }]
-          paging: { pageNumber: 0, pageSize: {{ page_size }} }
+            orders:
+              - { field: "validityEnd", direction: "ASC" }
+          paging:
+            pageNumber: 0
+            pageSize: "{{ page_size }}"
         status_code: 200
         return_content: true
       register: cert_page
@@ -93,6 +96,30 @@
       loop_control:
         label: "{{ item.subjectCN[0] }}"
 
+    # --- Record expected serial/fingerprint for verification later
+    - name: Read metadata of newly issued certs (serial, notAfter, SHA256 FP)
+      ansible.builtin.shell: |
+        set -o pipefail
+        openssl x509 -in "{{ work_dir }}/{{ item.subjectCN[0] }}.crt" -noout -serial -enddate -fingerprint -sha256
+      args:
+        executable: /bin/bash
+      register: issued_meta
+      changed_when: false
+      loop: "{{ expiring_soon }}"
+      loop_control:
+        label: "{{ item.subjectCN[0] }}"
+
+    - name: Build expected map (CN -> serial/fingerprint/not_after)
+      ansible.builtin.set_fact:
+        issued_expected: "{{ issued_expected | default({}) | combine({ (item.item.subjectCN[0]): {
+            'serial':      (item.stdout | regex_search('serial=([0-9A-F]+)', '\\1')),
+            'fingerprint': (item.stdout | regex_search('SHA256 Fingerprint=([0-9A-F:]+)', '\\1')),
+            'not_after':   (item.stdout | regex_search('notAfter=(.*)', '\\1'))
+          } }, recursive=True) }}"
+      loop: "{{ issued_meta.results }}"
+      loop_control:
+        label: "{{ item.item.subjectCN[0] }}"
+
 # Play 2: Deploy to your RHEL9 AWS instances
 - name: Deploy renewed certs to RHEL9 AWS instances
   hosts: aws_ec2
@@ -102,6 +129,7 @@
   vars:
     work_dir_ctrl: "{{ hostvars['localhost']['work_dir'] }}"
     expiring_list: "{{ hostvars['localhost']['expiring_soon'] }}"
+    issued_expected: "{{ hostvars['localhost']['issued_expected'] | default({}) }}"
 
     # Optional service handling
     service_to_reload: ""      # e.g. nginx | httpd | cockpit (blank = skip)
@@ -113,6 +141,11 @@
     reboot_connect_timeout: 10   # SSH connect timeout
     reboot_post_wait: 15         # seconds to wait after SSH comes back
     reboot_msg: "Reboot after cert deployment"
+
+    # Optional live TLS verification (set a port to enable)
+    verify_port: 0               # e.g. 9090 for Cockpit, 443 for nginx/httpd; 0 = skip
+    verify_connect_host: "{{ inventory_hostname }}"   # override if needed
+    verify_servername: "{{ inventory_hostname }}"     # SNI hostname; set to CN if virtual hosting
 
   tasks:
     - name: Ensure destination dirs
@@ -176,3 +209,94 @@
         post_reboot_delay: "{{ reboot_post_wait }}"
         msg: "{{ reboot_msg }}"
       when: reboot_hosts | bool
+
+    # --- Verification: ensure hosts are back and using the NEW certs
+
+    - name: Verify installed cert files match expected (serial & fingerprint)
+      ansible.builtin.shell: |
+        set -o pipefail
+        CRT="/etc/pki/tls/certs/{{ item.subjectCN[0] }}.crt"
+        if [ ! -f "$CRT" ]; then
+          echo "MISSING_FILE"
+          exit 2
+        fi
+        openssl x509 -in "$CRT" -noout -serial -fingerprint -sha256
+      args:
+        executable: /bin/bash
+      register: installed_meta
+      changed_when: false
+      failed_when: false          # we'll assert cleanly in next task
+      loop: "{{ expiring_list }}"
+      loop_control:
+        label: "{{ item.subjectCN[0] }}"
+
+    - name: Assert installed files equal expected serial/fingerprint
+      vars:
+        cn: "{{ item.item.subjectCN[0] }}"
+        expected: "{{ issued_expected[cn] | default({}) }}"
+        got_serial: "{{ item.stdout | regex_search('serial=([0-9A-F]+)', '\\1') | default('') }}"
+        got_fp: "{{ item.stdout | regex_search('SHA256 Fingerprint=([0-9A-F:]+)', '\\1') | default('') }}"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+          - expected is mapping
+          - expected.serial is defined
+          - expected.fingerprint is defined
+          - got_serial == expected.serial
+          - got_fp == expected.fingerprint
+        fail_msg: >-
+          Installed cert for {{ cn }} does not match expected.
+          Expected serial={{ expected.serial }}, fp={{ expected.fingerprint }};
+          Got serial={{ got_serial }}, fp={{ got_fp }}.
+      loop: "{{ installed_meta.results }}"
+      loop_control:
+        label: "{{ item.item.subjectCN[0] }}"
+
+    - name: Wait for service port (optional)
+      ansible.builtin.wait_for:
+        host: "{{ verify_connect_host }}"
+        port: "{{ verify_port }}"
+        delay: 0
+        timeout: 90
+        state: started
+      when: verify_port | int > 0
+
+    - name: Verify served certificate matches expected (optional)
+      vars:
+        # Choose which CN you expect the service to present; defaults to inventory hostname
+        verify_cn: "{{ verify_servername }}"
+        expected_served: "{{ issued_expected[verify_cn] | default({}) }}"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo | openssl s_client -servername "{{ verify_servername }}" -connect "{{ verify_connect_host }}:{{ verify_port }}" 2>/dev/null \
+          | openssl x509 -noout -serial -fingerprint -sha256
+      args:
+        executable: /bin/bash
+      register: served_meta
+      changed_when: false
+      when:
+        - verify_port | int > 0
+        - issued_expected | length > 0
+        - issued_expected[verify_servername] is defined
+
+    - name: Assert served certificate equals expected (optional)
+      vars:
+        verify_cn: "{{ verify_servername }}"
+        expected_served: "{{ issued_expected[verify_cn] | default({}) }}"
+        served_serial: "{{ served_meta.stdout | regex_search('serial=([0-9A-F]+)', '\\1') | default('') }}"
+        served_fp: "{{ served_meta.stdout | regex_search('SHA256 Fingerprint=([0-9A-F:]+)', '\\1') | default('') }}"
+      ansible.builtin.assert:
+        that:
+          - served_meta is defined
+          - expected_served is mapping
+          - expected_served.serial is defined
+          - expected_served.fingerprint is defined
+          - served_serial == expected_served.serial
+          - served_fp == expected_served.fingerprint
+        fail_msg: >-
+          Served cert (port {{ verify_port }}) does not match expected for {{ verify_cn }}.
+          Expected serial={{ expected_served.serial }}, fp={{ expected_served.fingerprint }};
+          Got serial={{ served_serial }}, fp={{ served_fp }}.
+      when:
+        - verify_port | int > 0
+        - served_meta is defined
