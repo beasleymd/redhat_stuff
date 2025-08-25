@@ -50,7 +50,7 @@
         body_format: json
         body:
           expression:
-            operator: "AND"  # FIX: boolean operator required
+            operator: "AND"   # explicit to avoid null-operator server error
             operands:
               - { field: "certificateStatus", operator: "EQ",  value: "ACTIVE" }
               - { field: "validityEnd",        operator: "GTE", value: "{{ now_iso }}" }
@@ -60,7 +60,7 @@
               - { field: "validityEnd", direction: "ASC" }
           paging:
             pageNumber: 0
-            pageSize: {{ page_size | int }}
+            pageSize: "{{ page_size | int }}"   # <-- QUOTED to satisfy YAML+Jinja
         status_code: 200
         return_content: true
       register: cert_page
@@ -97,18 +97,16 @@
       loop_control:
         label: "{{ item.subjectCN[0] }}"
 
-    # --- Record expected serial/fingerprint for verification later
+    # --- Record expected serial/fingerprint for verification later (used in Play 2)
     - name: Read metadata of newly issued certs (serial, notAfter, SHA256 FP)
       ansible.builtin.shell: |
         set -o pipefail
         openssl x509 -in "{{ work_dir }}/{{ item.subjectCN[0] }}.crt" -noout -serial -enddate -fingerprint -sha256
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
       register: issued_meta
       changed_when: false
       loop: "{{ expiring_soon }}"
-      loop_control:
-        label: "{{ item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
 
     - name: Build expected map (CN -> serial/fingerprint/not_after)
       ansible.builtin.set_fact:
@@ -118,14 +116,14 @@
             'not_after':   (item.stdout | regex_search('notAfter=(.*)', '\\1'))
           } }, recursive=True) }}"
       loop: "{{ issued_meta.results }}"
-      loop_control:
-        label: "{{ item.item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.item.subjectCN[0] }}" }
 
-# Play 2: Deploy to your RHEL9 AWS instances
+# Play 2: Deploy to your RHEL9 AWS instances (+ reboot + verify)
 - name: Deploy renewed certs to RHEL9 AWS instances
   hosts: aws_ec2
   become: true
   gather_facts: false
+  # serial: 1   # uncomment for rolling changes/reboots
 
   vars:
     work_dir_ctrl: "{{ hostvars['localhost']['work_dir'] }}"
@@ -136,15 +134,15 @@
     service_to_reload: ""      # e.g. nginx | httpd | cockpit (blank = skip)
     service_action: "reload"   # "reload" or "restart"
 
-    # Optional VM reboot (ON by default for your request)
+    # Optional VM reboot (enable per your request)
     reboot_hosts: true
     reboot_timeout: 900
     reboot_connect_timeout: 10
     reboot_post_wait: 15
     reboot_msg: "Reboot after cert deployment"
 
-    # Optional live TLS verification (set a port to enable)
-    verify_port: 0               # e.g. 9090 for Cockpit, 443 for nginx/httpd; 0 = skip
+    # Optional live TLS verification
+    verify_port: 0               # 9090 for Cockpit, 443 for nginx/httpd; 0 = skip
     verify_connect_host: "{{ inventory_hostname }}"
     verify_servername: "{{ inventory_hostname }}"
 
@@ -203,7 +201,7 @@
         state: "{{ 'restarted' if service_action == 'restart' else 'reloaded' }}"
       when: service_to_reload | length > 0
 
-    - name: Restart VMs (optional)
+    - name: Reboot VMs (optional)
       ansible.builtin.reboot:
         reboot_timeout: "{{ reboot_timeout }}"
         connect_timeout: "{{ reboot_connect_timeout }}"
@@ -221,14 +219,12 @@
           exit 2
         fi
         openssl x509 -in "$CRT" -noout -serial -fingerprint -sha256
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
       register: installed_meta
       changed_when: false
       failed_when: false
       loop: "{{ expiring_list }}"
-      loop_control:
-        label: "{{ item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
 
     - name: Assert installed files equal expected serial/fingerprint
       vars:
@@ -249,8 +245,7 @@
           Expected serial={{ expected.serial }}, fp={{ expected.fingerprint }};
           Got serial={{ got_serial }}, fp={{ got_fp }}.
       loop: "{{ installed_meta.results }}"
-      loop_control:
-        label: "{{ item.item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.item.subjectCN[0] }}" }
 
     - name: Wait for service port (optional)
       ansible.builtin.wait_for:
@@ -269,8 +264,7 @@
         set -o pipefail
         echo | openssl s_client -servername "{{ verify_servername }}" -connect "{{ verify_connect_host }}:{{ verify_port }}" 2>/dev/null \
           | openssl x509 -noout -serial -fingerprint -sha256
-      args:
-        executable: /bin/bash
+      args: { executable: /bin/bash }
       register: served_meta
       changed_when: false
       when:
