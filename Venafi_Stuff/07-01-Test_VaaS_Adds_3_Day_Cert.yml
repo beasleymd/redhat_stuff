@@ -1,13 +1,5 @@
 ---
-# Playbook: renew_expiring_in_3_days_and_deploy.yml
-# Purpose:
-# - Find ACTIVE certs in Venafi TLS Protect Cloud (VaaS) that expire in ≤ 3 days
-# - Issue fresh certs (using venafi_certificate) and stage them on the controller
-# - Deploy key/cert/chain to your RHEL9 AWS hosts in group "aws_ec2"
-
-# ----------------------
-# PLAY 1: Search + Issue
-# ----------------------
+# Play 1: Find certs expiring in ≤ 3 days; issue new ones via Venafi module
 - name: Renew certs expiring in ≤ 3 days and stage on controller
   hosts: localhost
   gather_facts: false
@@ -18,14 +10,13 @@
     # === Required ===
     vaas_api_key: "{{ venafi_api_key }}"
     vaas_api_url: "https://api.venafi.cloud"
-    # Zone is Application\IssuingTemplate (escape backslash in YAML)
-    zone: "AAP25DemoCrt\\AAP25DemoCertAPI"
+    # Zone is Application\IssuingTemplate (escape the backslash in YAML)
+    zone: "MyApplication\\MyIssuingTemplate"
 
     # === Tuning ===
     page_size: 1000
     work_dir: "/tmp/vaas_expiring3"
-
-    # Optional: override CN to a fixed name (normally reuse CN from each expiring cert)
+    # Optional: set the CN you want if you’re targeting a single name; otherwise we use the CN from search results
     # override_common_name: "app.internal.example"
 
   pre_tasks:
@@ -43,7 +34,8 @@
         fail_msg: "Set venafi_api_key (AAP var/credential)."
 
   tasks:
-    - name: Compute search window (UTC)
+    # --- search for certs expiring in ≤ 3 days
+    - name: Compute window (UTC)
       ansible.builtin.set_fact:
         now_iso: "{{ lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ') }}"
         plus3_iso: "{{ lookup('pipe','date -u -d +3days +%Y-%m-%dT%H:%M:%SZ') }}"
@@ -58,30 +50,16 @@
         body_format: json
         body:
           expression:
-            operator: AND          # <-- REQUIRED (fixes your 503)
             operands:
-              - field: "certificateStatus"
-                operator: "EQ"
-                value: "ACTIVE"
-              - field: "validityEnd"
-                operator: "GTE"
-                value: "{{ now_iso }}"
-              - field: "validityEnd"
-                operator: "LTE"
-                value: "{{ plus3_iso }}"
+              - { field: "certificateStatus", operator: "EQ",  value: "ACTIVE" }
+              - { field: "validityEnd",        operator: "GTE", value: "{{ now_iso }}" }
+              - { field: "validityEnd",        operator: "LTE", value: "{{ plus3_iso }}" }
           ordering:
-            orders:
-              - field: "validityEnd"
-                direction: "ASC"
-          paging:
-            pageNumber: 0
-            pageSize: "{{ page_size | int }}"   # <-- keep numeric
+            orders: [{ field: "validityEnd", direction: "ASC" }]
+          paging: { pageNumber: 0, pageSize: {{ page_size }} }
         status_code: 200
         return_content: true
       register: cert_page
-      retries: 3
-      delay: 2
-      until: cert_page.status == 200
 
     - name: Build expiring list
       ansible.builtin.set_fact:
@@ -91,22 +69,17 @@
       ansible.builtin.meta: end_play
       when: expiring_soon | length == 0
 
-    # Issue new certs using the Ansible module (generates key+CSR, picks up cert)
+    # --- for each expiring cert, request a new one using the module
     - name: Issue new certs via venafi_certificate (pickup=true)
       venafi.machine_identity.venafi_certificate:
         connection: cloud
         url: "{{ vaas_api_url }}"
         token: "{{ vaas_api_key }}"
         zone: "{{ zone }}"
-        # Use CN from expiring cert unless override_common_name is provided
+        # Use the CN from the expiring cert (or override if you set override_common_name)
         common_name: "{{ override_common_name | default(item.subjectCN[0], true) }}"
-        # SANs: include CN plus any DNS SANs from the existing cert (if present)
-        san_dns: >-
-          {{
-            ([override_common_name | default(item.subjectCN[0], true)] +
-             (item.subjectAlternativeNamesByType.dNSName | default([])))
-            | unique
-          }}
+        # If you need SANs, add them here (safe default is CN only)
+        san_dns: ["{{ override_common_name | default(item.subjectCN[0], true) }}"]
         algorithm: "RSA"
         key_size: 2048
         chain_option: "RootFirst"
@@ -120,23 +93,26 @@
       loop_control:
         label: "{{ item.subjectCN[0] }}"
 
-# ----------------------
-# PLAY 2: Deploy to VMs
-# ----------------------
+# Play 2: Deploy to your RHEL9 AWS instances
 - name: Deploy renewed certs to RHEL9 AWS instances
   hosts: aws_ec2
   become: true
   gather_facts: false
+
   vars:
-    # Pull data staged by Play 1
     work_dir_ctrl: "{{ hostvars['localhost']['work_dir'] }}"
     expiring_list: "{{ hostvars['localhost']['expiring_soon'] }}"
-    # Destination paths on the VMs (key/cert) + chain into trust (optional)
-    cert_dest:  "/etc/pki/tls/certs/{{ item.subjectCN[0] }}.crt"
-    key_dest:   "/etc/pki/tls/private/{{ item.subjectCN[0] }}.key"
-    chain_dest: "/etc/pki/ca-trust/source/anchors/{{ item.subjectCN[0] }}-chain.crt"
-    # Set a service to reload if you want, e.g., nginx | httpd | haproxy (blank = skip)
-    service_to_reload: ""
+
+    # Optional service handling
+    service_to_reload: ""      # e.g. nginx | httpd | cockpit (blank = skip)
+    service_action: "reload"   # "reload" or "restart"
+
+    # Optional VM reboot (ON by default for your request)
+    reboot_hosts: true
+    reboot_timeout: 900          # seconds to wait for reboot to complete
+    reboot_connect_timeout: 10   # SSH connect timeout
+    reboot_post_wait: 15         # seconds to wait after SSH comes back
+    reboot_msg: "Reboot after cert deployment"
 
   tasks:
     - name: Ensure destination dirs
@@ -149,40 +125,37 @@
         - "/etc/pki/tls/private"
         - "/etc/pki/ca-trust/source/anchors"
 
-    - name: Copy private key (0600)
+    - name: Copy private key(s)
       ansible.builtin.copy:
         src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.key"
-        dest: "{{ key_dest }}"
+        dest: "/etc/pki/tls/private/{{ item.subjectCN[0] }}.key"
         owner: root
         group: root
         mode: "0600"
       loop: "{{ expiring_list }}"
-      loop_control:
-        label: "{{ item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
 
-    - name: Copy certificate (0644)
+    - name: Copy certificate(s)
       ansible.builtin.copy:
         src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}.crt"
-        dest: "{{ cert_dest }}"
+        dest: "/etc/pki/tls/certs/{{ item.subjectCN[0] }}.crt"
         owner: root
         group: root
         mode: "0644"
       loop: "{{ expiring_list }}"
-      loop_control:
-        label: "{{ item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
 
-    - name: Copy chain into trust anchors (0644)
+    - name: Copy chain(s) to trust anchors
       ansible.builtin.copy:
         src:  "{{ work_dir_ctrl }}/{{ item.subjectCN[0] }}-chain.crt"
-        dest: "{{ chain_dest }}"
+        dest: "/etc/pki/ca-trust/source/anchors/{{ item.subjectCN[0] }}-chain.crt"
         owner: root
         group: root
         mode: "0644"
       loop: "{{ expiring_list }}"
-      loop_control:
-        label: "{{ item.subjectCN[0] }}"
+      loop_control: { label: "{{ item.subjectCN[0] }}" }
 
-    - name: Restore SELinux contexts (RHEL-friendly)
+    - name: Restore SELinux contexts
       ansible.builtin.command: "restorecon -Rv /etc/pki"
       changed_when: true
 
@@ -190,8 +163,16 @@
       ansible.builtin.command: "update-ca-trust"
       changed_when: true
 
-    - name: Reload service if requested
+    - name: "{{ service_action | capitalize }} service if requested"
       ansible.builtin.service:
         name: "{{ service_to_reload }}"
-        state: reloaded
+        state: "{{ 'restarted' if service_action == 'restart' else 'reloaded' }}"
       when: service_to_reload | length > 0
+
+    - name: Restart VMs (optional)
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: "{{ reboot_connect_timeout }}"
+        post_reboot_delay: "{{ reboot_post_wait }}"
+        msg: "{{ reboot_msg }}"
+      when: reboot_hosts | bool
