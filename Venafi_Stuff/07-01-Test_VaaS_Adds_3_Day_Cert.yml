@@ -50,6 +50,7 @@
         body_format: json
         body:
           expression:
+            operator: "AND"  # FIX: boolean operator required
             operands:
               - { field: "certificateStatus", operator: "EQ",  value: "ACTIVE" }
               - { field: "validityEnd",        operator: "GTE", value: "{{ now_iso }}" }
@@ -59,7 +60,7 @@
               - { field: "validityEnd", direction: "ASC" }
           paging:
             pageNumber: 0
-            pageSize: "{{ page_size }}"
+            pageSize: {{ page_size | int }}
         status_code: 200
         return_content: true
       register: cert_page
@@ -137,15 +138,15 @@
 
     # Optional VM reboot (ON by default for your request)
     reboot_hosts: true
-    reboot_timeout: 900          # seconds to wait for reboot to complete
-    reboot_connect_timeout: 10   # SSH connect timeout
-    reboot_post_wait: 15         # seconds to wait after SSH comes back
+    reboot_timeout: 900
+    reboot_connect_timeout: 10
+    reboot_post_wait: 15
     reboot_msg: "Reboot after cert deployment"
 
     # Optional live TLS verification (set a port to enable)
     verify_port: 0               # e.g. 9090 for Cockpit, 443 for nginx/httpd; 0 = skip
-    verify_connect_host: "{{ inventory_hostname }}"   # override if needed
-    verify_servername: "{{ inventory_hostname }}"     # SNI hostname; set to CN if virtual hosting
+    verify_connect_host: "{{ inventory_hostname }}"
+    verify_servername: "{{ inventory_hostname }}"
 
   tasks:
     - name: Ensure destination dirs
@@ -211,7 +212,6 @@
       when: reboot_hosts | bool
 
     # --- Verification: ensure hosts are back and using the NEW certs
-
     - name: Verify installed cert files match expected (serial & fingerprint)
       ansible.builtin.shell: |
         set -o pipefail
@@ -225,7 +225,7 @@
         executable: /bin/bash
       register: installed_meta
       changed_when: false
-      failed_when: false          # we'll assert cleanly in next task
+      failed_when: false
       loop: "{{ expiring_list }}"
       loop_control:
         label: "{{ item.subjectCN[0] }}"
@@ -263,7 +263,6 @@
 
     - name: Verify served certificate matches expected (optional)
       vars:
-        # Choose which CN you expect the service to present; defaults to inventory hostname
         verify_cn: "{{ verify_servername }}"
         expected_served: "{{ issued_expected[verify_cn] | default({}) }}"
       ansible.builtin.shell: |
